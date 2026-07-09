@@ -1,0 +1,30 @@
+{
+  "name": "openclaw-compact-handoff",
+  "version": "0.1.0",
+  "description": "OpenClaw hook pack that preserves session handoffs before compaction.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "files": [
+    "hooks/compact-handoff",
+    "scripts/test_compact_handoff_hook.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "openclaw": {
+    "extensions": [],
+    "hooks": [
+      "hooks/compact-handoff"
+    ]
+  },
+  "scripts": {
+    "test": "node scripts/test_compact_handoff_hook.mjs"
+  },
+  "keywords": [
+    "openclaw",
+    "hook",
+    "compaction",
+    "handoff",
+    "memory"
+  ]
+}
