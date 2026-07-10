@@ -85,6 +85,16 @@ The test covers:
 - redaction
 - health index creation
 
+## Post-Run Self-Check
+
+After changing or reinstalling the hook, run:
+
+```bash
+npm run postrun:check
+```
+
+The check verifies the hook registration, session-scoped handoff behavior, removal of the old global handoff fallback, redaction coverage, and the deterministic hook test. Treat a failed check as a failed release even if the gateway accepted the plugin.
+
 ## Safety Notes
 
 This hook is deterministic and local-only. It does not call an LLM or external API inside the Gateway hook path.
