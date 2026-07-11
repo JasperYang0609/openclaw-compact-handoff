@@ -6,6 +6,7 @@ const HOOK_NAME = "compact-handoff";
 const MAX_RECENT_MESSAGES = 24;
 const MAX_MESSAGE_CHARS = 1800;
 const MAX_BOOTSTRAP_CHARS = 30000;
+const MAX_PROJECT_POINTER_CHARS = 4000;
 const EARLY_TOKEN_RATIO = 0.65;
 const EARLY_FORCE_TOKEN_RATIO = 0.75;
 const EARLY_MIN_TOKEN_DELTA = 10000;
@@ -30,6 +31,12 @@ function topicIdFromSessionKey(sessionKey: string | undefined): string | undefin
   if (typeof sessionKey !== "string") return undefined;
   const parts = sessionKey.split(":");
   return parts.length >= 5 ? parts[parts.length - 1] : undefined;
+}
+
+function safeProjectName(input: unknown): string | undefined {
+  if (typeof input !== "string") return undefined;
+  const trimmed = input.trim();
+  return /^[a-z][a-z0-9_-]{1,63}$/.test(trimmed) ? trimmed : undefined;
 }
 
 function localTimestamp(date = new Date()): string {
@@ -62,6 +69,62 @@ async function readJsonFile(filePath: string): Promise<any | undefined> {
   } catch {
     return undefined;
   }
+}
+
+async function readProjectRegistration(workspaceDir: string, sessionKey: string | undefined): Promise<string | undefined> {
+  if (!sessionKey) return undefined;
+  const registry = await readJsonFile(path.join(workspaceDir, "memory", "project_states", "registry.json"));
+  return safeProjectName(registry?.sessions?.[sessionKey]?.project);
+}
+
+function boolLabel(value: unknown): string {
+  return value === true ? "true" : value === false ? "false" : "unknown";
+}
+
+function listLabel(value: unknown): string {
+  return Array.isArray(value) && value.length ? value.map((item) => String(item)).join(", ") : "none";
+}
+
+async function buildProjectRecoveryPointer(workspaceDir: string, sessionKey: string | undefined): Promise<{ project: string; content: string; virtualPath: string } | undefined> {
+  const project = await readProjectRegistration(workspaceDir, sessionKey);
+  if (!project) return undefined;
+  const projectDir = path.join(workspaceDir, "memory", "project_states", project);
+  const state = await readJsonFile(path.join(projectDir, "ACTIVE_TASK_STATE.json"));
+  const gates = await readJsonFile(path.join(projectDir, "PROJECT_GATES.json"));
+  if (!state || !gates) return undefined;
+
+  const lines = [
+    "## Project Recovery Pointer",
+    `- project: ${project}`,
+    `- current_mode: ${state.current_mode ?? "unknown"}`,
+    `- active_task_id: ${state.active_task_id ?? "none"}`,
+    `- task_title: ${state.task_title ?? "none"}`,
+    `- risk_level: ${state.risk_level ?? "unknown"}`,
+    `- requires_jasper_approval: ${boolLabel(state.requires_jasper_approval)}`,
+    `- requires_migration_first: ${boolLabel(state.requires_migration_first)}`,
+    `- allowed_actions: ${listLabel(state.allowed_actions)}`,
+    `- forbidden_actions: ${listLabel(gates.forbidden_actions)}`,
+    `- current_step: ${state.current_step ?? "unknown"}`,
+    `- next_step: ${state.next_step ?? "unknown"}`,
+    `- resume_instruction: ${state.resume_instruction ?? "Read project state files before acting."}`,
+    "- first_read_files:",
+    `  - memory/project_states/${project}/PROJECT_RULES.md`,
+    `  - memory/project_states/${project}/PROJECT_GATES.json`,
+    `  - memory/project_states/${project}/ACTIVE_TASK_STATE.json`,
+    `  - memory/project_states/${project}/RECOVERY_CHECKLIST.md`,
+    "- recovery_gate: run the project-state recovery/check script before acting when available.",
+    "",
+  ];
+
+  let content = redactSensitiveText(lines.join("\n"));
+  if (content.length > MAX_PROJECT_POINTER_CHARS) {
+    content = `${content.slice(0, MAX_PROJECT_POINTER_CHARS)}\n\n…[project recovery pointer truncated for bootstrap]`;
+  }
+  return {
+    project,
+    content,
+    virtualPath: path.join(projectDir, "PROJECT_RECOVERY.md"),
+  };
 }
 
 async function resolveSessionEntry(event: any): Promise<any> {
@@ -210,6 +273,7 @@ function buildHandoff(params: {
   recentMessages: string[];
   previous?: string;
   sessionEntry?: any;
+  projectPointer?: string;
 }): string {
   const { phase, event, recentMessages, previous } = params;
   const context = event.context || {};
@@ -255,6 +319,7 @@ function buildHandoff(params: {
     "- If this handoff conflicts with newer chat messages, newer chat messages win.",
     "- Do not expose secrets. Treat paths/tokens in transcripts carefully and redact before replying.",
     "",
+    ...(params.projectPointer ? [params.projectPointer.trimEnd(), ""] : []),
     "## Session Metadata",
     `- generatedAt: ${timestamp}`,
     `- sessionKey: ${sessionKey}`,
@@ -322,7 +387,8 @@ async function writeHandoff(event: any, phase: "before" | "after" | "early", res
   const sessionKeyOrId = event.sessionKey || sessionEntry.sessionId || "unknown";
   const recentMessages = await readRecentMessages(sessionEntry.sessionFile);
   const previous = await readExistingForSession(handoffDir, sessionKeyOrId);
-  const content = buildHandoff({ phase, event, recentMessages, previous, sessionEntry });
+  const projectPointer = await buildProjectRecoveryPointer(workspaceDir, sessionKeyOrId);
+  const content = buildHandoff({ phase, event, recentMessages, previous, sessionEntry, projectPointer: projectPointer?.content });
   const sessionSlug = safeSlug(sessionKeyOrId);
   const stamp = localTimestamp().replace(/[-:]/g, "");
   const archiveName = `${stamp}_${phase}_${sessionSlug}.md`;
@@ -333,6 +399,7 @@ async function writeHandoff(event: any, phase: "before" | "after" | "early", res
   if (scopedCurrentPath) await fs.writeFile(scopedCurrentPath, content, "utf8");
   await updateIndex(handoffDir, sessionKeyOrId, {
     phase,
+    project: projectPointer?.project,
     sessionId: sessionEntry.sessionId,
     sessionFile: sessionEntry.sessionFile,
     currentPath: scopedCurrentPath,
@@ -384,29 +451,53 @@ async function injectBootstrap(event: any) {
   if (!Array.isArray(context.bootstrapFiles)) return;
   const workspaceDir = workspaceDirFromEvent(event);
   const handoffDir = path.join(workspaceDir, "memory", "session_handoffs");
-  const currentPath = sessionScopedCurrentPath(handoffDir, event.sessionKey || context.sessionKey);
-  if (!currentPath) return;
-  let content: string;
-  try {
-    content = await fs.readFile(currentPath, "utf8");
-  } catch {
-    return;
+  await fs.mkdir(handoffDir, { recursive: true });
+  const sessionKey = event.sessionKey || context.sessionKey;
+  const currentPath = sessionScopedCurrentPath(handoffDir, sessionKey);
+  if (currentPath) {
+    let content: string | undefined;
+    try {
+      content = await fs.readFile(currentPath, "utf8");
+    } catch {
+      content = undefined;
+    }
+    if (content?.trim()) {
+      if (content.length > MAX_BOOTSTRAP_CHARS) {
+        content = `${content.slice(0, MAX_BOOTSTRAP_CHARS)}\n\n…[compact handoff truncated for bootstrap]`;
+      }
+      const alreadyInjected = context.bootstrapFiles.some((file: any) => file?.path === currentPath);
+      if (!alreadyInjected) {
+        context.bootstrapFiles = [
+          ...context.bootstrapFiles,
+          {
+            name: "MEMORY.md",
+            path: currentPath,
+            content,
+            missing: false,
+          },
+        ];
+      }
+    }
   }
-  if (!content.trim()) return;
-  if (content.length > MAX_BOOTSTRAP_CHARS) {
-    content = `${content.slice(0, MAX_BOOTSTRAP_CHARS)}\n\n…[compact handoff truncated for bootstrap]`;
-  }
-  const alreadyInjected = context.bootstrapFiles.some((file: any) => file?.path === currentPath);
-  if (alreadyInjected) return;
+
+  const projectPointer = await buildProjectRecoveryPointer(workspaceDir, sessionKey);
+  if (!projectPointer?.content.trim()) return;
+  const alreadyInjectedProject = context.bootstrapFiles.some((file: any) => file?.path === projectPointer.virtualPath || file?.name === "PROJECT_RECOVERY.md");
+  if (alreadyInjectedProject) return;
   context.bootstrapFiles = [
     ...context.bootstrapFiles,
     {
-      name: "MEMORY.md",
-      path: currentPath,
-      content,
+      name: "PROJECT_RECOVERY.md",
+      path: projectPointer.virtualPath,
+      content: projectPointer.content,
       missing: false,
     },
   ];
+  await updateIndex(handoffDir, sessionKey || "unknown", {
+    project: projectPointer.project,
+    lastProjectInjectedAt: localTimestamp(),
+    projectRecoveryPath: projectPointer.virtualPath,
+  });
 }
 
 const handler = async (event: any) => {

@@ -11,6 +11,51 @@ await fs.writeFile(sessionFile, [
   JSON.stringify({ type: 'message', message: { role: 'user', content: `token: ${'A'.repeat(96)}` } }),
 ].join('\n'));
 
+const projectRoot = path.join(root, 'memory/project_states/demo-project');
+await fs.mkdir(projectRoot, { recursive: true });
+await fs.writeFile(path.join(root, 'memory/project_states/registry.json'), JSON.stringify({
+  schema_version: 1,
+  sessions: {
+    'agent:main:test': {
+      project: 'demo-project',
+      registered_at: '2026-07-11T00:00:00+08:00',
+      registered_by: 'test',
+    },
+  },
+}, null, 2));
+await fs.writeFile(path.join(projectRoot, 'ACTIVE_TASK_STATE.json'), JSON.stringify({
+  schema_version: 1,
+  state_seq: 3,
+  project: 'demo-project',
+  updated_at: '2026-07-11T00:00:00+08:00',
+  updated_by: 'test',
+  update_reason: 'fixture',
+  current_mode: 'planning',
+  active_task_id: null,
+  task_title: null,
+  owner: 'test',
+  risk_level: 'none',
+  requires_git_preflight: false,
+  requires_branch: false,
+  requires_migration_first: false,
+  requires_jasper_approval: false,
+  allowed_actions: ['read', 'plan', 'write_spec'],
+  current_step: 'fixture current step',
+  next_step: 'fixture next step',
+  blockers: [],
+  latest_artifacts: [],
+  latest_commit: null,
+  completion_probe: null,
+  resume_instruction: 'Read demo project state before acting.',
+}, null, 2));
+await fs.writeFile(path.join(projectRoot, 'PROJECT_GATES.json'), JSON.stringify({
+  schema_version: 1,
+  project: 'demo-project',
+  forbidden_actions: ['demo_forbidden_action_a', 'fake_canvas_push'],
+  requires_approval_for: ['demo_approval_action'],
+  approvals: [],
+}, null, 2));
+
 const baseEvent = {
   type: 'session',
   action: 'compact:before',
@@ -34,6 +79,12 @@ if (!content.includes('Current Session Handoff') || !content.includes('compact h
 if (!content.includes('Deterministic Working State')) {
   throw new Error('handoff missing deterministic working state');
 }
+if (!content.includes('Project Recovery Pointer') || !content.includes('demo_forbidden_action_a')) {
+  throw new Error('handoff missing project recovery pointer');
+}
+if (content.indexOf('Project Recovery Pointer') > content.indexOf('## Session Metadata')) {
+  throw new Error('project recovery pointer must appear before session metadata');
+}
 if (content.includes('A'.repeat(40))) {
   throw new Error('handoff did not redact sensitive long-token content');
 }
@@ -47,7 +98,14 @@ const bootstrapEvent = {
   context: { workspaceDir: root, bootstrapFiles: [] },
 };
 await handler(bootstrapEvent);
-if (!bootstrapEvent.context.bootstrapFiles.length) throw new Error('bootstrap injection failed');
+if (bootstrapEvent.context.bootstrapFiles.length !== 2) throw new Error('bootstrap injection should include session handoff and project recovery');
+const projectBootstrap = bootstrapEvent.context.bootstrapFiles.find((file) => file.name === 'PROJECT_RECOVERY.md');
+if (!projectBootstrap || !projectBootstrap.content.includes('fake_canvas_push')) {
+  throw new Error('project recovery bootstrap entry missing expected fixture content');
+}
+if (projectBootstrap.content.length > 4100) {
+  throw new Error('project recovery bootstrap entry exceeded expected budget');
+}
 
 const otherBootstrapEvent = {
   type: 'agent',
@@ -97,6 +155,22 @@ if (!earlyContent.includes('phase: early-handoff') || !earlyContent.includes('to
   throw new Error('early handoff did not capture expected threshold metadata');
 }
 
+const unregisteredBootstrapEvent = {
+  type: 'agent',
+  action: 'bootstrap',
+  sessionKey: 'agent:main:high',
+  timestamp: new Date().toISOString(),
+  messages: [],
+  context: { workspaceDir: root, bootstrapFiles: [] },
+};
+await handler(unregisteredBootstrapEvent);
+if (unregisteredBootstrapEvent.context.bootstrapFiles.length !== 1) {
+  throw new Error('unregistered session with handoff should only inject the session MEMORY.md');
+}
+if (unregisteredBootstrapEvent.context.bootstrapFiles.some((file) => file.name === 'PROJECT_RECOVERY.md')) {
+  throw new Error('unregistered session must not inject project recovery');
+}
+
 const indexPath = path.join(root, 'memory/session_handoffs/index.json');
 const index = JSON.parse(await fs.readFile(indexPath, 'utf8'));
 if (!index.sessions['agent:main:high'] || !index.sessions['agent:main:test']) {
@@ -108,5 +182,6 @@ console.log(JSON.stringify({
   root,
   injected: bootstrapEvent.context.bootstrapFiles.length,
   otherInjected: otherBootstrapEvent.context.bootstrapFiles.length,
+  unregisteredInjected: unregisteredBootstrapEvent.context.bootstrapFiles.length,
   earlyPhase: index.sessions['agent:main:high'].phase,
 }));
