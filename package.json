@@ -8,6 +8,8 @@
   "files": [
     "hooks/compact-handoff",
     "scripts/test_compact_handoff_hook.mjs",
+    "scripts/test_compact_handoff_resilience.mjs",
+    "scripts/post_run_check.mjs",
     "README.md",
     "LICENSE"
   ],
@@ -18,7 +20,9 @@
     ]
   },
   "scripts": {
-    "test": "node scripts/test_compact_handoff_hook.mjs",
+    "test": "npm run test:core && npm run test:resilience",
+    "test:core": "node scripts/test_compact_handoff_hook.mjs",
+    "test:resilience": "node scripts/test_compact_handoff_resilience.mjs",
     "postrun:check": "node scripts/post_run_check.mjs"
   },
   "keywords": [

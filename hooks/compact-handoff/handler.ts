@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const HOOK_NAME = "compact-handoff";
 const MAX_RECENT_MESSAGES = 24;
@@ -13,8 +13,13 @@ const MAX_EXACT_REFERENCES = 20;
 const EARLY_TOKEN_RATIO = 0.65;
 const EARLY_FORCE_TOKEN_RATIO = 0.75;
 const EARLY_MIN_TOKEN_DELTA = 10000;
-const EARLY_MIN_INTERVAL_MS = 20 * 60 * 1000;
+const EARLY_HARD_MIN_INTERVAL_MS = 5 * 60 * 1000;
+const EARLY_REFRESH_INTERVAL_MS = 20 * 60 * 1000;
 const EARLY_TRANSCRIPT_BYTES = 1500 * 1000;
+const ARCHIVE_RETENTION_PER_PHASE = 5;
+const ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const ARCHIVE_INSTANCE_SEPARATOR = "@";
+const ARCHIVE_INSTANCE_SUFFIX_PATTERN = /^@[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type MessageProvenance = "real_user" | "assistant" | "synthetic_system" | "tool_or_runtime" | "unknown";
 
@@ -25,12 +30,29 @@ type TranscriptMessage = {
 };
 
 function logWarn(message: string, error?: unknown) {
-  const suffix = error instanceof Error ? `: ${error.message}` : error ? `: ${String(error)}` : "";
-  console.warn(`[${HOOK_NAME}] ${message}${suffix}`);
+  let code: string | undefined;
+  if (typeof error === "object" && error && "code" in error && typeof (error as any).code === "string") {
+    code = (error as any).code;
+  } else if (error instanceof SyntaxError) {
+    code = "SyntaxError";
+  } else if (error instanceof Error) {
+    code = "Error";
+  } else if (error) {
+    code = "unknown-error";
+  }
+  console.warn(`[${HOOK_NAME}] ${message}${code ? ` (${code})` : ""}`);
 }
 
-function safeSlug(input: string): string {
-  return input.replace(/[^a-zA-Z0-9_.:-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 180) || "unknown";
+function safeSlug(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_.:-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 180) || "unknown";
+}
+
+function sessionStorageSlug(value: string): string {
+  const original = String(value || "unknown");
+  const readable = safeSlug(original);
+  if (readable === original && original.length <= 180) return readable;
+  const digest = createHash("sha256").update(original, "utf8").digest("hex").slice(0, 32);
+  return `${readable.slice(0, 120)}~${digest}`;
 }
 
 function parseAgentId(sessionKey: string | undefined): string {
@@ -62,6 +84,42 @@ function localTimestamp(date = new Date()): string {
     hourCycle: "h23",
   }).format(date);
   return parts.replace(" ", "T");
+}
+
+async function syncDirectory(dirPath: string): Promise<void> {
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    handle = await fs.open(dirPath, "r");
+    await handle.sync();
+  } catch {
+    // Some filesystems do not support fsync on directories. The file itself is
+    // still synced before rename, so this is a durability enhancement only.
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function writeFileAtomic(filePath: string, content: string): Promise<void> {
+  const dirPath = path.dirname(filePath);
+  await fs.mkdir(dirPath, { recursive: true });
+  const tempPath = path.join(
+    dirPath,
+    `.${path.basename(filePath)}.tmp-${Date.now()}-${process.pid}-${randomUUID()}`,
+  );
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    handle = await fs.open(tempPath, "wx", 0o600);
+    await handle.writeFile(content, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await fs.rename(tempPath, filePath);
+    await syncDirectory(dirPath);
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    await fs.unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
 }
 
 function workspaceDirFromEvent(event: any): string {
@@ -335,9 +393,50 @@ function clip(text: string, max = MAX_SINGLE_EVIDENCE_CHARS): string {
   return clipUtf16Safe(normalized, max, "\n…[evidence truncated]");
 }
 
+function isEscapedAt(text: string, index: number): boolean {
+  let backslashes = 0;
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === "\\"; cursor -= 1) backslashes += 1;
+  return backslashes % 2 === 1;
+}
+
+function redactCookieHeaders(input: string): string {
+  const headerPattern = /\b(?:Cookie|Set-Cookie)\s*:\s*/gi;
+  let output = "";
+  let cursor = 0;
+  while (true) {
+    headerPattern.lastIndex = cursor;
+    const match = headerPattern.exec(input);
+    if (!match) break;
+    const valueStart = headerPattern.lastIndex;
+    const newlineIndex = input.indexOf("\n", valueStart);
+    const lineEnd = newlineIndex >= 0 ? newlineIndex : input.length;
+    const preceding = match.index > 0 ? input[match.index - 1] : undefined;
+    const enclosingQuote = preceding === "\"" || preceding === "'" ? preceding : undefined;
+    let valueEnd = lineEnd;
+    if (enclosingQuote) {
+      for (let index = valueStart; index < lineEnd; index += 1) {
+        if (input[index] === enclosingQuote && !isEscapedAt(input, index)) {
+          valueEnd = index;
+          break;
+        }
+      }
+    }
+    output += `${input.slice(cursor, valueStart)}[REDACTED]`;
+    cursor = valueEnd;
+  }
+  return `${output}${input.slice(cursor)}`;
+}
+
 function redactSensitiveText(input: string): string {
-  return input
-    .replace(/(service[_ -]?role[_ -]?key|api[_ -]?key|token|secret|password|bearer)\s*[:=]\s*["']?[^"'\s`]+/gi, "$1: [REDACTED]")
+  return redactCookieHeaders(input)
+    .replace(/-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----[\s\S]*?(?:-----END(?: [A-Z0-9]+)* PRIVATE KEY-----|$)/g, "[REDACTED_PRIVATE_KEY]")
+    .replace(/(Authorization\s*:\s*Bearer\s+)[^\s]+/gi, "$1[REDACTED]")
+    .replace(/(["'](?:service[_ -]?role[_ -]?key|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|secret|password|bearer)["']\s*:\s*)["'][^"'\r\n]+["']/gi, "$1\"[REDACTED]\"")
+
+    .replace(/\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})\b/g, "[REDACTED_GITHUB_TOKEN]")
+    .replace(/\bxox[a-zA-Z]-[A-Za-z0-9-]{10,}\b/g, "[REDACTED_SLACK_TOKEN]")
+    .replace(/([?&](?:token|key|secret|password|signature)=)[^&#\s]+/gi, "$1[REDACTED]")
+    .replace(/(service[_ -]?role[_ -]?key|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|secret|password|bearer)\s*[:=]\s*["']?[^"'\s`]+/gi, "$1: [REDACTED]")
     .replace(/\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b/g, "[REDACTED_JWT]")
     .replace(/\b(sk|ntn|sb|AIza)[A-Za-z0-9_-]{20,}\b/g, "[REDACTED_KEY]")
     .replace(/\b[A-Za-z0-9_-]{80,}\b/g, "[REDACTED_LONG_TOKEN]");
@@ -394,7 +493,17 @@ async function readRecentMessages(sessionFile: string | undefined): Promise<Tran
 
 function sessionScopedCurrentPath(handoffDir: string, sessionKeyOrId: string | undefined): string | undefined {
   if (!sessionKeyOrId || sessionKeyOrId === "unknown") return undefined;
-  return path.join(handoffDir, `session_${safeSlug(sessionKeyOrId)}.MEMORY.md`);
+  return path.join(handoffDir, `session_${sessionStorageSlug(sessionKeyOrId)}.MEMORY.md`);
+}
+
+function sessionScopedStatePath(handoffDir: string, sessionKeyOrId: string): string {
+  return path.join(handoffDir, `session_${sessionStorageSlug(sessionKeyOrId)}.state.json`);
+}
+
+function archiveBelongsToSession(scopedName: string, sessionStorageId: string): boolean {
+  if (scopedName === sessionStorageId) return true;
+  if (!scopedName.startsWith(sessionStorageId)) return false;
+  return ARCHIVE_INSTANCE_SUFFIX_PATTERN.test(scopedName.slice(sessionStorageId.length));
 }
 
 function firstMatchingRecentMessage(recentMessages: TranscriptMessage[], provenance: MessageProvenance): string | undefined {
@@ -551,28 +660,169 @@ async function transcriptByteSize(sessionFile: string | undefined): Promise<numb
 }
 
 async function readEarlyState(handoffDir: string, sessionKeyOrId: string): Promise<any> {
-  const statePath = path.join(handoffDir, `session_${safeSlug(sessionKeyOrId)}.state.json`);
+  const statePath = path.join(handoffDir, `session_${sessionStorageSlug(sessionKeyOrId)}.state.json`);
   return (await readJsonFile(statePath)) || {};
 }
 
 async function writeEarlyState(handoffDir: string, sessionKeyOrId: string, state: any) {
-  const statePath = path.join(handoffDir, `session_${safeSlug(sessionKeyOrId)}.state.json`);
-  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const statePath = path.join(handoffDir, `session_${sessionStorageSlug(sessionKeyOrId)}.state.json`);
+  await writeFileAtomic(statePath, `${JSON.stringify(state, null, 2)}\n`);
 }
 
-async function updateIndex(handoffDir: string, sessionKeyOrId: string, payload: any) {
+const indexUpdateQueues = new Map<string, Promise<void>>();
+
+async function readIndexForUpdate(indexPath: string): Promise<any> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(indexPath, "utf8");
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return { sessions: {} };
+    throw error;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("index root is not an object");
+    }
+    if (
+      "sessions" in parsed
+      && (!parsed.sessions || typeof parsed.sessions !== "object" || Array.isArray(parsed.sessions))
+    ) {
+      throw new Error("index sessions is not an object");
+    }
+    return parsed;
+  } catch (error: any) {
+    const corruptPath = `${indexPath}.corrupt-${Date.now()}-${process.pid}-${randomUUID()}`;
+    try {
+      await fs.rename(indexPath, corruptPath);
+      await syncDirectory(path.dirname(indexPath));
+      const reason = error instanceof SyntaxError ? "invalid JSON" : "invalid index shape";
+      logWarn(`preserved malformed index at ${path.basename(corruptPath)} (${reason})`);
+      return { sessions: {} };
+    } catch (renameError: any) {
+      if (renameError?.code === "ENOENT") return { sessions: {} };
+      throw renameError;
+    }
+  }
+}
+
+async function updateIndexUnlocked(handoffDir: string, sessionKeyOrId: string, payload: any) {
   const indexPath = path.join(handoffDir, "index.json");
-  const index = (await readJsonFile(indexPath)) || { sessions: {} };
-  index.sessions ||= {};
+  const index = await readIndexForUpdate(indexPath);
+  index.sessions = Object.assign(Object.create(null), index.sessions || {});
   index.sessions[sessionKeyOrId] = {
     ...(index.sessions[sessionKeyOrId] || {}),
     ...payload,
     updatedAt: localTimestamp(),
   };
-  await fs.writeFile(indexPath, `${JSON.stringify(index, null, 2)}\n`, "utf8");
+  await writeFileAtomic(indexPath, `${JSON.stringify(index, null, 2)}\n`);
 }
 
-async function writeHandoff(event: any, phase: "before" | "after" | "early", resolvedEntry?: any) {
+async function withIndexUpdateQueue(handoffDir: string, task: () => Promise<void>) {
+  const indexPath = path.join(handoffDir, "index.json");
+  const previous = indexUpdateQueues.get(indexPath) || Promise.resolve();
+  const operation = previous.catch(() => undefined).then(task);
+  indexUpdateQueues.set(indexPath, operation);
+  try {
+    await operation;
+  } finally {
+    if (indexUpdateQueues.get(indexPath) === operation) indexUpdateQueues.delete(indexPath);
+  }
+}
+
+async function updateIndex(handoffDir: string, sessionKeyOrId: string, payload: any) {
+  await withIndexUpdateQueue(handoffDir, () => updateIndexUnlocked(handoffDir, sessionKeyOrId, payload));
+}
+
+async function commitCurrentAndIndex(
+  handoffDir: string,
+  sessionKeyOrId: string,
+  currentPath: string,
+  content: string,
+  payload: any,
+) {
+  await withIndexUpdateQueue(handoffDir, async () => {
+    const indexPath = path.join(handoffDir, "index.json");
+    const index = await readIndexForUpdate(indexPath);
+    index.sessions = Object.assign(Object.create(null), index.sessions || {});
+    index.sessions[sessionKeyOrId] = {
+      ...(index.sessions[sessionKeyOrId] || {}),
+      ...payload,
+      updatedAt: localTimestamp(),
+    };
+
+    let previousCurrent: string | undefined;
+    let previousCurrentExists = false;
+    try {
+      previousCurrent = await fs.readFile(currentPath, "utf8");
+      previousCurrentExists = true;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+
+    await writeFileAtomic(currentPath, content);
+    try {
+      await writeFileAtomic(indexPath, `${JSON.stringify(index, null, 2)}\n`);
+    } catch (error) {
+      try {
+        if (previousCurrentExists) {
+          await writeFileAtomic(currentPath, previousCurrent || "");
+        } else {
+          await fs.unlink(currentPath).catch((unlinkError: any) => {
+            if (unlinkError?.code !== "ENOENT") throw unlinkError;
+          });
+          await syncDirectory(path.dirname(currentPath));
+        }
+      } catch {
+        logWarn("failed to restore current handoff after index commit failure");
+      }
+      throw error;
+    }
+  });
+}
+
+async function pruneArchives(
+  handoffDir: string,
+  sessionSlug: string,
+  phase: "before" | "after" | "early",
+  now = Date.now(),
+  protectedArchivePath?: string,
+): Promise<void> {
+  const prefixPattern = /^\d{8}T\d{6}_(before|after|early)_(.+)\.md$/;
+  const entries = await fs.readdir(handoffDir, { withFileTypes: true });
+  const candidates: Array<{ path: string; mtimeMs: number }> = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const match = entry.name.match(prefixPattern);
+    if (!match || match[1] !== phase) continue;
+    const scopedName = match[2];
+    if (!archiveBelongsToSession(scopedName, sessionSlug)) continue;
+    const archivePath = path.join(handoffDir, entry.name);
+    try {
+      const stat = await fs.stat(archivePath);
+      candidates.push({ path: archivePath, mtimeMs: stat.mtimeMs });
+    } catch {
+      // A concurrent cleanup may already have removed it.
+    }
+  }
+  const protectedCandidate = protectedArchivePath
+    ? candidates.find((candidate) => candidate.path === protectedArchivePath)
+    : undefined;
+  const unprotectedCandidates = candidates
+    .filter((candidate) => candidate !== protectedCandidate)
+    .sort((left, right) => right.mtimeMs - left.mtimeMs || right.path.localeCompare(left.path));
+  const unprotectedLimit = Math.max(0, ARCHIVE_RETENTION_PER_PHASE - (protectedCandidate ? 1 : 0));
+  const removals = unprotectedCandidates.filter((candidate, index) => (
+    now - candidate.mtimeMs > ARCHIVE_RETENTION_MS || index >= unprotectedLimit
+  ));
+  for (const candidate of removals) {
+    await fs.unlink(candidate.path).catch((error: any) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+  }
+}
+
+async function writeHandoffUnlocked(event: any, phase: "before" | "after" | "early", resolvedEntry?: any) {
   const workspaceDir = workspaceDirFromEvent(event);
   const handoffDir = path.join(workspaceDir, "memory", "session_handoffs");
   await fs.mkdir(handoffDir, { recursive: true });
@@ -582,15 +832,14 @@ async function writeHandoff(event: any, phase: "before" | "after" | "early", res
   const recentMessages = await readRecentMessages(sessionEntry.sessionFile);
   const projectPointer = await buildProjectRecoveryPointer(workspaceDir, sessionKeyOrId);
   const content = buildHandoff({ phase, event, recentMessages, sessionEntry, projectPointer: projectPointer?.content });
-  const sessionSlug = safeSlug(sessionKeyOrId);
+  const sessionSlug = sessionStorageSlug(sessionKeyOrId);
   const stamp = localTimestamp().replace(/[-:]/g, "");
-  const archiveName = `${stamp}_${phase}_${sessionSlug}.md`;
+  const archiveName = `${stamp}_${phase}_${sessionSlug}${ARCHIVE_INSTANCE_SEPARATOR}${randomUUID()}.md`;
   const archivePath = path.join(handoffDir, archiveName);
   const scopedCurrentPath = sessionScopedCurrentPath(handoffDir, sessionKeyOrId);
 
-  await fs.writeFile(archivePath, content, "utf8");
-  if (scopedCurrentPath) await fs.writeFile(scopedCurrentPath, content, "utf8");
-  await updateIndex(handoffDir, sessionKeyOrId, {
+  await writeFileAtomic(archivePath, content);
+  const indexPayload = {
     phase,
     project: projectPointer?.project,
     sessionId: sessionEntry.sessionId,
@@ -599,10 +848,47 @@ async function writeHandoff(event: any, phase: "before" | "after" | "early", res
     archivePath,
     totalTokens: sessionEntry.totalTokens,
     contextTokens: sessionEntry.contextTokens,
-  });
+  };
+  try {
+    if (scopedCurrentPath) {
+      await commitCurrentAndIndex(handoffDir, sessionKeyOrId, scopedCurrentPath, content, indexPayload);
+    } else {
+      await updateIndex(handoffDir, sessionKeyOrId, indexPayload);
+    }
+  } catch (error) {
+    try {
+      await fs.unlink(archivePath).catch((unlinkError: any) => {
+        if (unlinkError?.code !== "ENOENT") throw unlinkError;
+      });
+      await syncDirectory(handoffDir);
+    } catch (cleanupError) {
+      logWarn("failed to remove uncommitted archive", cleanupError);
+    }
+    throw error;
+  }
+  await pruneArchives(handoffDir, sessionSlug, phase, Date.now(), archivePath);
 }
 
-async function maybeWriteEarlyHandoff(event: any) {
+const handoffWriteQueues = new Map<string, Promise<void>>();
+
+async function writeHandoff(event: any, phase: "before" | "after" | "early", resolvedEntry?: any) {
+  const workspaceDir = workspaceDirFromEvent(event);
+  const eventEntry = resolvedEntry || sessionEntryFromEvent(event);
+  const sessionIdentity = event.sessionKey || eventEntry.sessionId || event.context?.sessionId || "unknown";
+  const queueKey = `${workspaceDir}\u0000${sessionIdentity}`;
+  const previous = handoffWriteQueues.get(queueKey) || Promise.resolve();
+  const operation = previous
+    .catch(() => undefined)
+    .then(() => writeHandoffUnlocked(event, phase, resolvedEntry));
+  handoffWriteQueues.set(queueKey, operation);
+  try {
+    await operation;
+  } finally {
+    if (handoffWriteQueues.get(queueKey) === operation) handoffWriteQueues.delete(queueKey);
+  }
+}
+
+async function maybeWriteEarlyHandoffUnlocked(event: any) {
   const workspaceDir = workspaceDirFromEvent(event);
   const handoffDir = path.join(workspaceDir, "memory", "session_handoffs");
   await fs.mkdir(handoffDir, { recursive: true });
@@ -623,11 +909,44 @@ async function maybeWriteEarlyHandoff(event: any) {
   const lastAt = typeof state.lastEarlyAtMs === "number" ? state.lastEarlyAtMs : 0;
   const lastTokens = typeof state.lastEarlyTokens === "number" ? state.lastEarlyTokens : 0;
   const tokenDelta = totalTokens !== undefined ? totalTokens - lastTokens : 0;
-  const shouldRefresh = ratio >= EARLY_FORCE_TOKEN_RATIO || !lastAt || now - lastAt >= EARLY_MIN_INTERVAL_MS || tokenDelta >= EARLY_MIN_TOKEN_DELTA;
-  if (!shouldRefresh) return;
+  const clockRollback = lastAt > now;
+  const elapsed = Math.max(0, now - lastAt);
+  const bucket = ratio >= EARLY_FORCE_TOKEN_RATIO ? "high" : "soft";
+  const lastRatio = typeof state.lastRatio === "number" ? state.lastRatio : 0;
+  const lastBucket = state.lastBucket === "high" || state.lastBucket === "soft"
+    ? state.lastBucket
+    : lastRatio >= EARLY_FORCE_TOKEN_RATIO
+    ? "high"
+    : "soft";
+  const lastObservedBucket = state.lastObservedBucket === "high" || state.lastObservedBucket === "soft"
+    ? state.lastObservedBucket
+    : lastBucket;
+  const hardFloorElapsed = elapsed >= EARLY_HARD_MIN_INTERVAL_MS;
+  const highToSoft = lastBucket === "high" && bucket === "soft";
+  const directionalRefresh = lastObservedBucket === "soft" && bucket === "high" && hardFloorElapsed;
+  const highToHighDeltaRefresh = lastBucket === "high"
+    && bucket === "high"
+    && tokenDelta >= EARLY_MIN_TOKEN_DELTA
+    && hardFloorElapsed;
+  const intervalRefresh = elapsed >= EARLY_REFRESH_INTERVAL_MS && !highToSoft;
+  const shouldRefresh = !lastAt
+    || (!highToSoft && (clockRollback || intervalRefresh || directionalRefresh || highToHighDeltaRefresh));
+  if (!shouldRefresh) {
+    if (bucket === "soft" && lastObservedBucket !== "soft") {
+      await writeEarlyState(handoffDir, sessionKeyOrId, {
+        ...state,
+        lastObservedBucket: "soft",
+      });
+    }
+    return;
+  }
 
   event.context ||= {};
-  event.context.triggerReason = ratio >= EARLY_TOKEN_RATIO ? `token-ratio-${ratio.toFixed(2)}` : `transcript-bytes-${byteSize}`;
+  event.context.triggerReason = clockRollback
+    ? "persisted-clock-in-future"
+    : ratio >= EARLY_TOKEN_RATIO
+    ? `token-ratio-${ratio.toFixed(2)}`
+    : `transcript-bytes-${byteSize}`;
   await writeHandoff(event, "early", sessionEntry);
   await writeEarlyState(handoffDir, sessionKeyOrId, {
     lastEarlyAtMs: now,
@@ -636,7 +955,31 @@ async function maybeWriteEarlyHandoff(event: any) {
     lastEarlyContextTokens: contextTokens,
     lastTranscriptBytes: byteSize,
     lastRatio: ratio,
+    lastBucket: bucket,
+    lastObservedBucket: bucket,
   });
+}
+
+const earlyWriteQueues = new Map<string, Promise<void>>();
+
+async function maybeWriteEarlyHandoff(event: any) {
+  const context = event.context || {};
+  const workspaceDir = workspaceDirFromEvent(event);
+  const sessionIdentity = event.sessionKey
+    || context.sessionKey
+    || context.sessionEntry?.sessionId
+    || "unknown";
+  const queueKey = `${workspaceDir}\u0000${sessionIdentity}`;
+  const previous = earlyWriteQueues.get(queueKey) || Promise.resolve();
+  const operation = previous
+    .catch(() => undefined)
+    .then(() => maybeWriteEarlyHandoffUnlocked(event));
+  earlyWriteQueues.set(queueKey, operation);
+  try {
+    await operation;
+  } finally {
+    if (earlyWriteQueues.get(queueKey) === operation) earlyWriteQueues.delete(queueKey);
+  }
 }
 
 async function injectBootstrap(event: any) {

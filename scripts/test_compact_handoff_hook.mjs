@@ -516,11 +516,20 @@ if (!index.sessions['agent:main:high'] || !index.sessions['agent:main:test']) {
   throw new Error('handoff index missing expected sessions');
 }
 
-console.log(JSON.stringify({
+const result = {
   ok: true,
   root,
   injected: bootstrapEvent.context.bootstrapFiles.length,
   otherInjected: otherBootstrapEvent.context.bootstrapFiles.length,
   unregisteredInjected: unregisteredBootstrapEvent.context.bootstrapFiles.length,
   earlyPhase: index.sessions['agent:main:high'].phase,
-}));
+  cleaned: true,
+};
+await fs.rm(root, { recursive: true, force: true });
+try {
+  await fs.access(root);
+  throw new Error('successful core suite left its temporary tree behind');
+} catch (error) {
+  if (error?.code !== 'ENOENT') throw error;
+}
+console.log(JSON.stringify(result));
