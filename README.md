@@ -8,9 +8,16 @@ It is designed for long-running GPT/Codex sessions where compaction can cause th
 
 - Writes an early handoff when a session reaches context pressure.
 - Writes pre-compaction and post-compaction snapshots.
+- Emits schema v2 metadata with a unique `generationId` for each handoff.
+- Classifies transcript provenance and only treats trusted `real_user` messages as the latest user request.
+- Excludes prior compact handoffs and bootstrap blocks instead of recursively embedding them.
 - Injects only the matching `sessionKey` handoff at bootstrap.
 - Avoids cross-channel/thread leakage by never reading a global latest handoff.
 - Redacts obvious token, key, JWT, and long-secret patterns before storing recent transcript excerpts.
+- Clips CJK and emoji text on UTF-16-safe boundaries.
+- Enforces hard budgets: handoff body 8,000 characters, project recovery pointer 2,000 characters, and combined custom bootstrap 10,000 characters.
+- Limits a single transcript evidence item to 1,200 characters and exact-reference lists to 20 items.
+- Omits empty operator templates; absent evidence is not replaced with a blank checklist.
 - Maintains a lightweight `index.json` for health/debug visibility.
 
 ## Install
@@ -78,12 +85,19 @@ npm test
 
 The test covers:
 
-- bootstrap injection
+- bootstrap injection and the 8K/2K/10K hard budgets
 - cross-session isolation
+- provenance-aware latest real user detection
+- synthetic approval/memory-flush/runtime notice filtering
+- non-recursive handoff generation
+- schema v2 and unique generation IDs
+- UTF-16-safe CJK/emoji clipping
 - early threshold handoff
 - low-pressure skip
 - redaction
 - health index creation
+
+`recentTurnsPreserve: 3` is not a required hook setting. It is only a conditional, separately approved mitigation when an isolated replay proves that the current native compaction suffix still exceeds its budget; do not change it merely to install this hook.
 
 ## Post-Run Self-Check
 
