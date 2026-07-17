@@ -1,13 +1,33 @@
 {
   "name": "openclaw-compact-handoff",
-  "version": "0.1.0",
-  "description": "OpenClaw hook pack that preserves session handoffs before compaction.",
+  "version": "0.2.0",
+  "description": "Provider-independent OpenClaw hook pack for session continuity around context compaction.",
   "type": "module",
   "license": "MIT",
   "private": false,
+  "author": "JasperYang0609",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JasperYang0609/openclaw-compact-handoff.git"
+  },
+  "homepage": "https://github.com/JasperYang0609/openclaw-compact-handoff#readme",
+  "bugs": {
+    "url": "https://github.com/JasperYang0609/openclaw-compact-handoff/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "files": [
     "hooks/compact-handoff",
     "scripts/test_compact_handoff_hook.mjs",
+    "scripts/test_compact_handoff_resilience.mjs",
+    "scripts/test_compact_handoff_p1c.mjs",
+    "scripts/test_session_authority.mjs",
+    "scripts/post_run_check.mjs",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "INSTALL.md",
+    "llms.txt",
     "README.md",
     "LICENSE"
   ],
@@ -18,7 +38,11 @@
     ]
   },
   "scripts": {
-    "test": "node scripts/test_compact_handoff_hook.mjs",
+    "test": "npm run test:core && npm run test:resilience && npm run test:p1c && npm run test:authority",
+    "test:core": "node scripts/test_compact_handoff_hook.mjs",
+    "test:resilience": "node scripts/test_compact_handoff_resilience.mjs",
+    "test:p1c": "node scripts/test_compact_handoff_p1c.mjs",
+    "test:authority": "node scripts/test_session_authority.mjs",
     "postrun:check": "node scripts/post_run_check.mjs"
   },
   "keywords": [
@@ -26,6 +50,8 @@
     "hook",
     "compaction",
     "handoff",
-    "memory"
+    "memory",
+    "context-window",
+    "llm"
   ]
 }
