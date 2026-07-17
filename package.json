@@ -9,6 +9,8 @@
     "hooks/compact-handoff",
     "scripts/test_compact_handoff_hook.mjs",
     "scripts/test_compact_handoff_resilience.mjs",
+    "scripts/test_compact_handoff_p1c.mjs",
+    "scripts/test_session_authority.mjs",
     "scripts/post_run_check.mjs",
     "README.md",
     "LICENSE"
@@ -20,9 +22,10 @@
     ]
   },
   "scripts": {
-    "test": "npm run test:core && npm run test:resilience",
+    "test": "npm run test:core && npm run test:resilience && npm run test:p1c",
     "test:core": "node scripts/test_compact_handoff_hook.mjs",
     "test:resilience": "node scripts/test_compact_handoff_resilience.mjs",
+    "test:p1c": "node scripts/test_compact_handoff_p1c.mjs",
     "postrun:check": "node scripts/post_run_check.mjs"
   },
   "keywords": [

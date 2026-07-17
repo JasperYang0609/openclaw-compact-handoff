@@ -2,9 +2,15 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import handler from '../hooks/compact-handoff/handler.ts';
+import { pathToFileURL } from 'node:url';
+import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import rawHandler from '../hooks/compact-handoff/handler.ts';
+import { createSessionAuthorityHarness } from './test_session_authority.mjs';
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'compact-handoff-resilience-'));
+const sessionAuthority = await createSessionAuthorityHarness(rawHandler, root);
+const { handler } = sessionAuthority;
 const handoffDir = path.join(root, 'memory', 'session_handoffs');
 await fs.mkdir(handoffDir, { recursive: true });
 
@@ -91,6 +97,446 @@ const missingConcurrent = concurrentKeys.filter((sessionKey) => !concurrentIndex
 if (missingConcurrent.length) {
   throw new Error(`concurrent index updates were lost: ${missingConcurrent.join(', ')}`);
 }
+
+// Independent module instances (or gateway processes) do not share the in-memory
+// queue Map. Force both to read the same index snapshot and require lossless merge.
+const isolatedKeys = [
+  'agent:main:isolated-module-a',
+  'agent:main:isolated-module-b',
+];
+const isolatedFiles = await Promise.all(isolatedKeys.map((_, index) => (
+  writeTranscript(`isolated-module-${index}`, `isolated module request ${index}`)
+)));
+const isolatedAuthorities = await Promise.all(isolatedKeys.map((sessionKey, index) => (
+  sessionAuthority.registerSessionFixture(
+    sessionKey,
+    `isolated-module-${index}-session`,
+    isolatedFiles[index],
+  )
+)));
+const isolatedEvents = isolatedKeys.map((sessionKey, index) => eventFor(
+  sessionKey,
+  'compact:before',
+  isolatedAuthorities[index].sessionFile,
+  {
+    sessionId: isolatedAuthorities[index].sessionId,
+    sessionFile: isolatedAuthorities[index].sessionFile,
+  },
+));
+const isolatedModuleUrl = new URL('../hooks/compact-handoff/handler.ts', import.meta.url);
+const [isolatedHandlerA, isolatedHandlerB] = await Promise.all([
+  import(`${isolatedModuleUrl.href}?isolated=a-${Date.now()}`).then((module) => module.default),
+  import(`${isolatedModuleUrl.href}?isolated=b-${Date.now()}`).then((module) => module.default),
+]);
+const originalOpenForIsolatedIndexRace = fs.open;
+let isolatedIndexReadArrivals = 0;
+let releaseIsolatedIndexReads;
+const isolatedIndexReadBarrier = new Promise((resolve) => {
+  releaseIsolatedIndexReads = resolve;
+});
+fs.open = async (target, ...args) => {
+  const handle = await originalOpenForIsolatedIndexRace.call(fs, target, ...args);
+  if (String(target) === indexPath) {
+    const originalHandleRead = handle.read.bind(handle);
+    let participated = false;
+    handle.read = async (...readArgs) => {
+      const result = await originalHandleRead(...readArgs);
+      if (!participated) {
+        participated = true;
+        isolatedIndexReadArrivals += 1;
+        if (isolatedIndexReadArrivals >= 2) releaseIsolatedIndexReads();
+        await Promise.race([
+          isolatedIndexReadBarrier,
+          new Promise((resolve) => setTimeout(resolve, 150)),
+        ]);
+      }
+      return result;
+    };
+  }
+  return handle;
+};
+try {
+  await Promise.all([
+    isolatedHandlerA(isolatedEvents[0]),
+    isolatedHandlerB(isolatedEvents[1]),
+  ]);
+} finally {
+  fs.open = originalOpenForIsolatedIndexRace;
+}
+const isolatedIndex = JSON.parse(await fs.readFile(indexPath, 'utf8'));
+const missingIsolatedKeys = isolatedKeys.filter((sessionKey) => !isolatedIndex.sessions?.[sessionKey]);
+if (isolatedIndexReadArrivals !== 2 || missingIsolatedKeys.length) {
+  throw new Error(`independent handler instances lost shared index updates: ${JSON.stringify({
+    isolatedIndexReadArrivals,
+    missingIsolatedKeys,
+  })}`);
+}
+
+const isolatedBootstrapKey = 'agent:main:isolated-bootstrap-one-shot';
+const isolatedBootstrapCurrent = path.join(
+  handoffDir,
+  `session_${slug(isolatedBootstrapKey)}.MEMORY.md`,
+);
+const isolatedBootstrapState = path.join(
+  handoffDir,
+  `session_${slug(isolatedBootstrapKey)}.state.json`,
+);
+await fs.writeFile(isolatedBootstrapCurrent, [
+  '# Current Session Handoff — Compact Safe',
+  '## Session Metadata',
+  '- schemaVersion: 2',
+  `- generationId: ${fixtureUuid(900, '90000000')}`,
+].join('\n'), { mode: 0o600 });
+await fs.writeFile(isolatedBootstrapState, '{}\n', { mode: 0o600 });
+const isolatedBootstrapEvents = [0, 1].map(() => ({
+  type: 'agent',
+  action: 'bootstrap',
+  sessionKey: isolatedBootstrapKey,
+  timestamp: new Date().toISOString(),
+  messages: [],
+  context: { workspaceDir: root, bootstrapFiles: [] },
+}));
+const originalOpenForIsolatedBootstrapRace = fs.open;
+let isolatedStateReadArrivals = 0;
+let releaseIsolatedStateReads;
+const isolatedStateReadBarrier = new Promise((resolve) => {
+  releaseIsolatedStateReads = resolve;
+});
+fs.open = async (target, ...args) => {
+  const handle = await originalOpenForIsolatedBootstrapRace.call(fs, target, ...args);
+  if (String(target) === isolatedBootstrapState) {
+    const originalHandleRead = handle.read.bind(handle);
+    let participated = false;
+    handle.read = async (...readArgs) => {
+      const result = await originalHandleRead(...readArgs);
+      if (!participated) {
+        participated = true;
+        isolatedStateReadArrivals += 1;
+        if (isolatedStateReadArrivals >= 2) releaseIsolatedStateReads();
+        await Promise.race([
+          isolatedStateReadBarrier,
+          new Promise((resolve) => setTimeout(resolve, 150)),
+        ]);
+      }
+      return result;
+    };
+  }
+  return handle;
+};
+try {
+  await Promise.all([
+    isolatedHandlerA(isolatedBootstrapEvents[0]),
+    isolatedHandlerB(isolatedBootstrapEvents[1]),
+  ]);
+} finally {
+  fs.open = originalOpenForIsolatedBootstrapRace;
+}
+const isolatedBootstrapInjections = isolatedBootstrapEvents.filter((event) => (
+  event.context.bootstrapFiles.some((file) => file.path === isolatedBootstrapCurrent)
+)).length;
+if (isolatedStateReadArrivals !== 2 || isolatedBootstrapInjections !== 1) {
+  throw new Error(`independent handler instances duplicated one-shot bootstrap injection: ${JSON.stringify({
+    isolatedStateReadArrivals,
+    isolatedBootstrapInjections,
+  })}`);
+}
+
+// Exercise the same lifecycle lock through two real Node processes. The first
+// process pauses after reading state; the second can reach that point only if
+// the filesystem lock is absent. With the lock present, the first times out of
+// the test barrier, commits, releases, and the second observes the committed
+// one-shot record.
+const crossProcessSessionKey = 'agent:main:cross-process-bootstrap';
+const crossProcessCurrent = path.join(handoffDir, `session_${crossProcessSessionKey}.MEMORY.md`);
+const crossProcessState = path.join(handoffDir, `session_${crossProcessSessionKey}.state.json`);
+const crossProcessReadyDir = path.join(root, 'cross-process-ready');
+await fs.mkdir(crossProcessReadyDir, { recursive: true });
+await fs.writeFile(crossProcessCurrent, [
+  '# Compact Handoff',
+  '',
+  'Generated: 2026-07-16 14:00:00 UTC',
+  'Schema-Version: 2',
+  `Generation-ID: ${randomUUID()}`,
+  `Session-Key: ${crossProcessSessionKey}`,
+  'Phase: after',
+  '',
+  '## Current Goal',
+  'Cross-process one-shot lifecycle replay.',
+].join('\n'), { mode: 0o600 });
+await fs.writeFile(crossProcessState, '{}\n', { mode: 0o600 });
+
+const childSource = String.raw`
+import fs from 'node:fs/promises';
+import path from 'node:path';
+
+const statePath = process.env.CROSS_PROCESS_STATE;
+const readyDir = process.env.CROSS_PROCESS_READY_DIR;
+const childId = process.env.CROSS_PROCESS_CHILD_ID;
+const originalOpen = fs.open;
+let paused = false;
+fs.open = async function patchedOpen(target, ...args) {
+  const handle = await originalOpen.call(this, target, ...args);
+  if (String(target) === statePath) {
+    const originalRead = handle.read.bind(handle);
+    handle.read = async (...readArgs) => {
+      const result = await originalRead(...readArgs);
+      if (!paused) {
+        paused = true;
+        await fs.writeFile(path.join(readyDir, childId), 'ready');
+        const deadline = Date.now() + 250;
+        while (Date.now() < deadline) {
+          const names = await fs.readdir(readyDir);
+          if (names.includes('a') && names.includes('b')) break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+      return result;
+    };
+  }
+  return handle;
+};
+
+const { default: handler } = await import(process.env.CROSS_PROCESS_HANDLER_URL);
+const event = {
+  type: 'agent',
+  action: 'bootstrap',
+  sessionKey: process.env.CROSS_PROCESS_SESSION_KEY,
+  context: {
+    workspaceDir: process.env.CROSS_PROCESS_WORKSPACE,
+    sessionKey: process.env.CROSS_PROCESS_SESSION_KEY,
+    bootstrapFiles: [],
+  },
+};
+await handler(event);
+const injected = event.context.bootstrapFiles.filter((file) => file.path === process.env.CROSS_PROCESS_CURRENT).length;
+process.stdout.write(JSON.stringify({ childId, injected }) + '\n');
+`;
+
+function runCrossProcessChild(childId) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', childSource], {
+      env: {
+        ...process.env,
+        CROSS_PROCESS_CHILD_ID: childId,
+        CROSS_PROCESS_CURRENT: crossProcessCurrent,
+        CROSS_PROCESS_HANDLER_URL: new URL('../hooks/compact-handoff/handler.ts', import.meta.url).href,
+        CROSS_PROCESS_READY_DIR: crossProcessReadyDir,
+        CROSS_PROCESS_SESSION_KEY: crossProcessSessionKey,
+        CROSS_PROCESS_STATE: crossProcessState,
+        CROSS_PROCESS_WORKSPACE: root,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`cross-process lifecycle child timed out: ${childId}`));
+    }, 10000);
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        reject(new Error(`cross-process lifecycle child failed: ${JSON.stringify({ childId, code, stderr })}`));
+        return;
+      }
+      try {
+        const line = stdout.trim().split('\n').at(-1);
+        resolve(JSON.parse(line));
+      } catch (error) {
+        reject(new Error(`cross-process lifecycle child returned invalid output: ${JSON.stringify({ childId, stdout, stderr })}`, { cause: error }));
+      }
+    });
+  });
+}
+
+const crossProcessResults = await Promise.all([
+  runCrossProcessChild('a'),
+  runCrossProcessChild('b'),
+]);
+const crossProcessBootstrapInjections = crossProcessResults
+  .reduce((sum, result) => sum + Number(result.injected || 0), 0);
+if (crossProcessBootstrapInjections !== 1) {
+  throw new Error(`separate Node processes duplicated one-shot bootstrap injection: ${JSON.stringify(crossProcessResults)}`);
+}
+
+// A stale lock may be recovered only after its bounded metadata identifies a
+// process that no longer exists. Recovery must then complete the real write and
+// release the replacement lock.
+const staleLockSessionKey = 'agent:main:stale-dead-owner-lock';
+const staleLockPath = path.join(handoffDir, `.compact-handoff.session-${slug(staleLockSessionKey)}.lock`);
+const staleLockTranscript = await writeTranscript('stale-dead-owner-lock');
+const deadOwnerPid = await new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' });
+  const pid = child.pid;
+  child.on('error', reject);
+  child.on('close', (code) => {
+    if (code !== 0 || !pid) reject(new Error(`dead-owner fixture child failed: ${code}`));
+    else resolve(pid);
+  });
+});
+await fs.writeFile(staleLockPath, `${JSON.stringify({ pid: deadOwnerPid, createdAtMs: 1 })}\n`, { mode: 0o600 });
+const staleLockTime = new Date(Date.now() - 3 * 60 * 1000);
+await fs.utimes(staleLockPath, staleLockTime, staleLockTime);
+const originalOpenForStaleLock = fs.open;
+const observedStaleLockOpenPaths = [];
+fs.open = async (target, ...args) => {
+  if (String(target).includes('.compact-handoff.') && String(target).endsWith('.lock')) {
+    observedStaleLockOpenPaths.push(String(target));
+  }
+  return originalOpenForStaleLock.call(fs, target, ...args);
+};
+try {
+  await handler(eventFor(staleLockSessionKey, 'compact:before', staleLockTranscript));
+} finally {
+  fs.open = originalOpenForStaleLock;
+}
+let staleLockRemained = true;
+try {
+  await fs.access(staleLockPath);
+} catch (error) {
+  if (error?.code !== 'ENOENT') throw error;
+  staleLockRemained = false;
+}
+const staleLockCurrent = path.join(handoffDir, `session_${slug(staleLockSessionKey)}.MEMORY.md`);
+if (staleLockRemained || !(await fs.readFile(staleLockCurrent, 'utf8')).includes(staleLockSessionKey)) {
+  throw new Error(`dead-owner stale filesystem lock did not recover safely: ${JSON.stringify({
+    staleLockPath,
+    staleLockRemained,
+    observedStaleLockOpenPaths,
+  })}`);
+}
+
+// Two stale-lock reapers must not both retire the same observed inode. This
+// fixture imports two real copies of the production helper and changes only the
+// scheduling immediately before stale retirement: reaper B is paused until
+// reaper A has acquired the successor lock and entered its protected task.
+const lockRaceSourcePath = new URL('../hooks/compact-handoff/handler.ts', import.meta.url);
+const lockRaceSource = await fs.readFile(lockRaceSourcePath, 'utf8');
+const staleRetireNeedle = '          await fs.unlink(lockPath).catch((unlinkError: any) => {';
+if (lockRaceSource.split(staleRetireNeedle).length !== 2) {
+  throw new Error('stale-recovery race fixture could not locate the unique retirement boundary');
+}
+const instrumentedLockRaceSource = `${lockRaceSource.replace(
+  staleRetireNeedle,
+  `          await globalThis.__compactHandoffBeforeStaleRetire?.(lockPath);\n${staleRetireNeedle}`,
+)}\nexport { withFilesystemLock };\n`;
+const lockRaceModuleAPath = path.join(root, 'lock-race-handler-a.ts');
+const lockRaceModuleBPath = path.join(root, 'lock-race-handler-b.ts');
+await fs.writeFile(lockRaceModuleAPath, instrumentedLockRaceSource, { mode: 0o600 });
+await fs.writeFile(lockRaceModuleBPath, instrumentedLockRaceSource, { mode: 0o600 });
+const [{ withFilesystemLock: withLockA }, { withFilesystemLock: withLockB }] = await Promise.all([
+  import(`${pathToFileURL(lockRaceModuleAPath).href}?copy=a`),
+  import(`${pathToFileURL(lockRaceModuleBPath).href}?copy=b`),
+]);
+const staleRecoveryRaceLock = path.join(handoffDir, '.compact-handoff.stale-recovery-race.lock');
+await fs.writeFile(
+  staleRecoveryRaceLock,
+  `${JSON.stringify({ pid: deadOwnerPid, createdAtMs: 1 })}\n`,
+  { mode: 0o600 },
+);
+await fs.utimes(staleRecoveryRaceLock, staleLockTime, staleLockTime);
+let staleRetireArrivals = 0;
+let resolveSecondStaleRetire;
+const secondStaleRetire = new Promise((resolve) => { resolveSecondStaleRetire = resolve; });
+let releaseSecondStaleRetire;
+const secondStaleRetireRelease = new Promise((resolve) => { releaseSecondStaleRetire = resolve; });
+let resolveFirstProtectedTask;
+const firstProtectedTask = new Promise((resolve) => { resolveFirstProtectedTask = resolve; });
+let activeProtectedTasks = 0;
+let maxActiveProtectedTasks = 0;
+let protectedTaskEntries = 0;
+const protectedTask = async () => {
+  activeProtectedTasks += 1;
+  maxActiveProtectedTasks = Math.max(maxActiveProtectedTasks, activeProtectedTasks);
+  protectedTaskEntries += 1;
+  if (protectedTaskEntries === 1) resolveFirstProtectedTask();
+  await new Promise((resolve) => setTimeout(resolve, protectedTaskEntries === 1 ? 300 : 20));
+  activeProtectedTasks -= 1;
+};
+const previousStaleRetireHook = globalThis.__compactHandoffBeforeStaleRetire;
+globalThis.__compactHandoffBeforeStaleRetire = async (target) => {
+  if (target !== staleRecoveryRaceLock) return;
+  staleRetireArrivals += 1;
+  if (staleRetireArrivals === 1) {
+    await Promise.race([
+      secondStaleRetire,
+      new Promise((resolve) => setTimeout(resolve, 200)),
+    ]);
+  } else if (staleRetireArrivals === 2) {
+    resolveSecondStaleRetire();
+    await secondStaleRetireRelease;
+  }
+};
+try {
+  const lockAttempts = [
+    withLockA(staleRecoveryRaceLock, protectedTask),
+    withLockB(staleRecoveryRaceLock, protectedTask),
+  ];
+  await Promise.race([
+    firstProtectedTask,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error('stale-recovery race fixture never entered the first protected task')),
+      2000,
+    )),
+  ]);
+  releaseSecondStaleRetire();
+  await Promise.all(lockAttempts);
+} finally {
+  globalThis.__compactHandoffBeforeStaleRetire = previousStaleRetireHook;
+  await fs.unlink(staleRecoveryRaceLock).catch(() => undefined);
+  await fs.unlink(`${staleRecoveryRaceLock}.recovery`).catch(() => undefined);
+}
+if (maxActiveProtectedTasks !== 1 || protectedTaskEntries !== 2) {
+  throw new Error(`concurrent stale recovery violated filesystem-lock exclusion: ${JSON.stringify({
+    maxActiveProtectedTasks,
+    protectedTaskEntries,
+    staleRetireArrivals,
+  })}`);
+}
+
+// If the elected reaper itself dies, its recovery marker is not safe to
+// reclaim with another pathname race. Preserve it and fail this attempt closed
+// until an operator verifies and removes the marker.
+const interruptedRecoveryKey = 'agent:main:interrupted-lock-recovery';
+const interruptedRecoveryLock = path.join(
+  handoffDir,
+  `.compact-handoff.session-${slug(interruptedRecoveryKey)}.lock`,
+);
+const interruptedRecoveryMarker = `${interruptedRecoveryLock}.recovery`;
+const interruptedRecoveryBytes = `${JSON.stringify({
+  pid: deadOwnerPid,
+  createdAtMs: 1,
+  targetDev: 1,
+  targetIno: 1,
+})}\n`;
+await fs.writeFile(interruptedRecoveryMarker, interruptedRecoveryBytes, { mode: 0o600 });
+await fs.utimes(interruptedRecoveryMarker, staleLockTime, staleLockTime);
+const interruptedRecoveryTranscript = await writeTranscript('interrupted-lock-recovery');
+await handler(eventFor(interruptedRecoveryKey, 'compact:before', interruptedRecoveryTranscript));
+const interruptedRecoveryCurrent = path.join(
+  handoffDir,
+  `session_${slug(interruptedRecoveryKey)}.MEMORY.md`,
+);
+let interruptedRecoveryCreatedOutput = false;
+for (const candidate of [interruptedRecoveryLock, interruptedRecoveryCurrent]) {
+  try {
+    await fs.access(candidate);
+    interruptedRecoveryCreatedOutput = true;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
+if (interruptedRecoveryCreatedOutput
+    || await fs.readFile(interruptedRecoveryMarker, 'utf8') !== interruptedRecoveryBytes) {
+  throw new Error('interrupted stale recovery did not preserve its marker and fail closed');
+}
+await fs.unlink(interruptedRecoveryMarker);
 
 // Invalid JSON must be preserved as a corrupt artifact before a new index is written.
 const malformedIndexSecret = 'P1B_INDEX_WARNING_SECRET_123456789';
@@ -197,6 +643,320 @@ if (generationId(rollbackCurrentAfter) !== generationId(rollbackCurrentBefore)) 
 const rollbackArchivesAfter = await archiveNames(malformedShapeKey, 'before');
 if (rollbackArchivesAfter.length !== rollbackArchivesBefore.length) {
   throw new Error('failed index rename left an uncommitted archive');
+}
+
+// Failure while atomically replacing current must preserve the prior current/index and remove the new archive.
+const currentWriteFailureFile = await writeTranscript('current-write-failure', 'current write failure request');
+const currentWriteIndexBeforeRaw = await fs.readFile(indexPath, 'utf8');
+const currentWriteIndexBefore = JSON.parse(currentWriteIndexBeforeRaw);
+const currentWriteEntryBefore = structuredClone(currentWriteIndexBefore.sessions[malformedShapeKey]);
+const currentWriteContentBefore = await fs.readFile(currentWriteEntryBefore.currentPath, 'utf8');
+const currentWriteArchivesBefore = await archiveNames(malformedShapeKey, 'before');
+const originalRenameForCurrentWriteFailure = fs.rename;
+let currentWriteFailureInjected = false;
+fs.rename = async (source, destination) => {
+  if (destination === currentWriteEntryBefore.currentPath) {
+    currentWriteFailureInjected = true;
+    throw Object.assign(new Error('injected current handoff rename failure'), { code: 'EIO' });
+  }
+  return originalRenameForCurrentWriteFailure(source, destination);
+};
+try {
+  await handler(eventFor(malformedShapeKey, 'compact:before', currentWriteFailureFile));
+} finally {
+  fs.rename = originalRenameForCurrentWriteFailure;
+}
+if (!currentWriteFailureInjected) {
+  throw new Error('current write failure fixture did not reach the intended atomic rename');
+}
+const currentWriteIndexAfterRaw = await fs.readFile(indexPath, 'utf8');
+if (currentWriteIndexAfterRaw !== currentWriteIndexBeforeRaw) {
+  throw new Error('failed current handoff write changed the live index');
+}
+const currentWriteContentAfter = await fs.readFile(currentWriteEntryBefore.currentPath, 'utf8');
+if (currentWriteContentAfter !== currentWriteContentBefore) {
+  throw new Error('failed current handoff write changed the prior live current content');
+}
+const currentWriteArchivesAfter = await archiveNames(malformedShapeKey, 'before');
+if (currentWriteArchivesAfter.length !== currentWriteArchivesBefore.length) {
+  throw new Error('failed current handoff write left an uncommitted archive');
+}
+
+// Index rewrites must discard arbitrary root/session properties instead of reserializing attacker data.
+const indexAllowlistSecret = 'P1C_INDEX_UNKNOWN_SECRET_MUST_NOT_PERSIST';
+const indexBeforeAllowlist = JSON.parse(await fs.readFile(indexPath, 'utf8'));
+indexBeforeAllowlist.unknownRootSecret = indexAllowlistSecret;
+indexBeforeAllowlist.sessions[malformedShapeKey].unknownEntrySecret = indexAllowlistSecret;
+await fs.writeFile(indexPath, `${JSON.stringify(indexBeforeAllowlist, null, 2)}\n`, { mode: 0o600 });
+const indexAllowlistKey = 'agent:main:index-allowlist';
+const indexAllowlistFile = await writeTranscript('index-allowlist');
+await handler(eventFor(indexAllowlistKey, 'compact:before', indexAllowlistFile));
+const indexAfterAllowlistRaw = await fs.readFile(indexPath, 'utf8');
+const indexAfterAllowlist = JSON.parse(indexAfterAllowlistRaw);
+if (indexAfterAllowlistRaw.includes(indexAllowlistSecret)
+    || Object.keys(indexAfterAllowlist).some((key) => key !== 'sessions')) {
+  throw new Error('index update reserialized arbitrary secret-bearing root/session properties');
+}
+
+// Oversized index content must be rejected from opened-handle metadata before
+// any content read, and the failed transaction must leave no current/archive.
+const oversizedIndexKey = 'agent:main:index-oversized';
+const oversizedIndexFile = await writeTranscript('index-oversized');
+const oversizedIndexBeforeRaw = await fs.readFile(indexPath, 'utf8');
+const oversizedIndexPayload = `${JSON.stringify({ sessions: {}, padding: 'x'.repeat(512 * 1024) })}\n`;
+const oversizedIndexArchivesBefore = await archiveNames(oversizedIndexKey, 'before');
+const oversizedIndexCurrent = path.join(handoffDir, `session_${slug(oversizedIndexKey)}.MEMORY.md`);
+await fs.writeFile(indexPath, oversizedIndexPayload, { mode: 0o600 });
+const originalOpenForOversizedIndex = fs.open;
+let oversizedIndexReadCount = 0;
+fs.open = async (target, ...args) => {
+  const handle = await originalOpenForOversizedIndex.call(fs, target, ...args);
+  if (String(target) === indexPath) {
+    const originalRead = handle.read.bind(handle);
+    handle.read = async (...readArgs) => {
+      oversizedIndexReadCount += 1;
+      return originalRead(...readArgs);
+    };
+  }
+  return handle;
+};
+try {
+  await handler(eventFor(oversizedIndexKey, 'compact:before', oversizedIndexFile));
+} finally {
+  fs.open = originalOpenForOversizedIndex;
+}
+const oversizedIndexAfterRaw = await fs.readFile(indexPath, 'utf8');
+const oversizedIndexArchivesAfter = await archiveNames(oversizedIndexKey, 'before');
+let oversizedIndexCurrentExists = true;
+try {
+  await fs.access(oversizedIndexCurrent);
+} catch (error) {
+  if (error?.code !== 'ENOENT') throw error;
+  oversizedIndexCurrentExists = false;
+}
+await fs.writeFile(indexPath, oversizedIndexBeforeRaw, { mode: 0o600 });
+if (oversizedIndexReadCount !== 0
+    || oversizedIndexAfterRaw !== oversizedIndexPayload
+    || oversizedIndexArchivesAfter.length !== oversizedIndexArchivesBefore.length
+    || oversizedIndexCurrentExists) {
+  throw new Error(`oversized index was read or partially committed before the 512 KiB bound rejected it: ${JSON.stringify({
+    oversizedIndexReadCount,
+    indexUnchanged: oversizedIndexAfterRaw === oversizedIndexPayload,
+    archiveDelta: oversizedIndexArchivesAfter.length - oversizedIndexArchivesBefore.length,
+    oversizedIndexCurrentExists,
+  })}`);
+}
+
+// The live index must be read through a bounded O_NOFOLLOW opened handle.
+const indexSymlinkKey = 'agent:main:index-symlink';
+const indexSymlinkFile = await writeTranscript('index-symlink');
+const indexSymlinkTarget = path.join(root, 'index-symlink-target.json');
+const indexSymlinkBackup = `${indexPath}.pre-symlink`;
+const indexSymlinkSecret = 'P1C_INDEX_SYMLINK_TARGET_SECRET';
+const indexBeforeSymlinkRaw = await fs.readFile(indexPath, 'utf8');
+await fs.writeFile(indexSymlinkTarget, `${JSON.stringify({
+  unknownRootSecret: indexSymlinkSecret,
+  sessions: JSON.parse(indexBeforeSymlinkRaw).sessions,
+}, null, 2)}\n`, { mode: 0o600 });
+const indexSymlinkTargetBefore = await fs.readFile(indexSymlinkTarget, 'utf8');
+const indexSymlinkArchivesBefore = await archiveNames(indexSymlinkKey, 'before');
+await fs.rename(indexPath, indexSymlinkBackup);
+await fs.symlink(indexSymlinkTarget, indexPath);
+await handler(eventFor(indexSymlinkKey, 'compact:before', indexSymlinkFile));
+const indexRemainedSymlink = (await fs.lstat(indexPath)).isSymbolicLink();
+const indexSymlinkTargetAfter = await fs.readFile(indexSymlinkTarget, 'utf8');
+const indexSymlinkArchivesAfter = await archiveNames(indexSymlinkKey, 'before');
+await fs.unlink(indexPath);
+await fs.rename(indexSymlinkBackup, indexPath);
+await fs.unlink(indexSymlinkTarget);
+for (const name of indexSymlinkArchivesAfter) {
+  if (!indexSymlinkArchivesBefore.includes(name)) await fs.unlink(path.join(handoffDir, name)).catch(() => undefined);
+}
+await fs.unlink(path.join(handoffDir, `session_${slug(indexSymlinkKey)}.MEMORY.md`)).catch(() => undefined);
+if (!indexRemainedSymlink
+    || indexSymlinkTargetAfter !== indexSymlinkTargetBefore
+    || indexSymlinkArchivesAfter.length !== indexSymlinkArchivesBefore.length) {
+  throw new Error('index symlink was followed or replaced instead of failing closed');
+}
+
+// Snapshotting a prior current handoff must also be bounded and no-follow.
+const safeSnapshotIndexRaw = await fs.readFile(indexPath, 'utf8');
+const safeSnapshotIndex = JSON.parse(safeSnapshotIndexRaw);
+const safeSnapshotEntry = structuredClone(safeSnapshotIndex.sessions[malformedShapeKey]);
+const safeSnapshotCurrent = safeSnapshotEntry.currentPath;
+const safeSnapshotBackup = `${safeSnapshotCurrent}.pre-symlink`;
+const safeSnapshotVictim = path.join(root, 'current-snapshot-symlink-target.md');
+const safeSnapshotVictimSecret = 'P1C_CURRENT_SNAPSHOT_SYMLINK_SECRET';
+const safeSnapshotArchivesBefore = await archiveNames(malformedShapeKey, 'before');
+await fs.writeFile(safeSnapshotVictim, safeSnapshotVictimSecret, { mode: 0o600 });
+await fs.rename(safeSnapshotCurrent, safeSnapshotBackup);
+await fs.symlink(safeSnapshotVictim, safeSnapshotCurrent);
+const safeSnapshotFile = await writeTranscript('current-snapshot-symlink');
+await handler(eventFor(malformedShapeKey, 'compact:before', safeSnapshotFile));
+const currentRemainedSymlink = (await fs.lstat(safeSnapshotCurrent)).isSymbolicLink();
+const safeSnapshotVictimAfter = await fs.readFile(safeSnapshotVictim, 'utf8');
+const safeSnapshotIndexAfterRaw = await fs.readFile(indexPath, 'utf8');
+const safeSnapshotArchivesAfter = await archiveNames(malformedShapeKey, 'before');
+await fs.rm(safeSnapshotCurrent, { force: true });
+await fs.rename(safeSnapshotBackup, safeSnapshotCurrent);
+await fs.writeFile(indexPath, safeSnapshotIndexRaw, { mode: 0o600 });
+await fs.unlink(safeSnapshotVictim);
+for (const name of safeSnapshotArchivesAfter) {
+  if (!safeSnapshotArchivesBefore.includes(name)) await fs.unlink(path.join(handoffDir, name)).catch(() => undefined);
+}
+if (!currentRemainedSymlink
+    || safeSnapshotVictimAfter !== safeSnapshotVictimSecret
+    || safeSnapshotIndexAfterRaw !== safeSnapshotIndexRaw
+    || safeSnapshotArchivesAfter.length !== safeSnapshotArchivesBefore.length) {
+  throw new Error('current rollback snapshot followed or replaced a symlink');
+}
+
+// If index commit and current rollback both fail, retain evidence and block bootstrap with a pending marker.
+const rollbackFailureIndexBeforeRaw = await fs.readFile(indexPath, 'utf8');
+const rollbackFailureIndexBefore = JSON.parse(rollbackFailureIndexBeforeRaw);
+const rollbackFailureEntry = structuredClone(rollbackFailureIndexBefore.sessions[malformedShapeKey]);
+const rollbackFailureCurrent = rollbackFailureEntry.currentPath;
+const rollbackFailureCurrentBefore = await fs.readFile(rollbackFailureCurrent, 'utf8');
+const rollbackFailureArchivesBefore = await archiveNames(malformedShapeKey, 'before');
+const rollbackFailureFile = await writeTranscript('current-rollback-failure', 'rollback must remain fail closed');
+const rollbackFailureMarker = `${rollbackFailureCurrent}.pending`;
+const originalRenameForRollbackFailure = fs.rename;
+let rollbackFailureCurrentRenames = 0;
+let rollbackFailureIndexInjected = false;
+let rollbackFailureRestoreInjected = false;
+fs.rename = async (source, destination) => {
+  if (destination === rollbackFailureCurrent) {
+    rollbackFailureCurrentRenames += 1;
+    if (rollbackFailureCurrentRenames >= 2) {
+      rollbackFailureRestoreInjected = true;
+      throw Object.assign(new Error('injected current rollback failure'), { code: 'EIO' });
+    }
+  }
+  if (destination === indexPath) {
+    rollbackFailureIndexInjected = true;
+    throw Object.assign(new Error('injected index commit failure before rollback'), { code: 'EIO' });
+  }
+  return originalRenameForRollbackFailure(source, destination);
+};
+try {
+  await handler(eventFor(malformedShapeKey, 'compact:before', rollbackFailureFile));
+} finally {
+  fs.rename = originalRenameForRollbackFailure;
+}
+const rollbackFailureIndexAfterRaw = await fs.readFile(indexPath, 'utf8');
+const rollbackFailureCurrentAfter = await fs.readFile(rollbackFailureCurrent, 'utf8');
+const rollbackFailureArchivesAfter = await archiveNames(malformedShapeKey, 'before');
+let rollbackFailureMarkerExists = true;
+await fs.access(rollbackFailureMarker).catch(() => { rollbackFailureMarkerExists = false; });
+const rollbackFailureBootstrapEvent = {
+  type: 'agent',
+  action: 'bootstrap',
+  sessionKey: malformedShapeKey,
+  timestamp: new Date().toISOString(),
+  messages: [],
+  context: {
+    workspaceDir: root,
+    bootstrapFiles: [{ name: 'MEMORY.md', path: rollbackFailureCurrent, content: 'PRELOADED_UNCOMMITTED_CURRENT', missing: false }],
+  },
+};
+await handler(rollbackFailureBootstrapEvent);
+const rollbackFailureInjected = rollbackFailureBootstrapEvent.context.bootstrapFiles.some(
+  (file) => file.path === rollbackFailureCurrent,
+);
+await fs.writeFile(rollbackFailureCurrent, rollbackFailureCurrentBefore, { mode: 0o600 });
+await fs.writeFile(indexPath, rollbackFailureIndexBeforeRaw, { mode: 0o600 });
+await fs.unlink(rollbackFailureMarker).catch(() => undefined);
+for (const name of rollbackFailureArchivesAfter) {
+  if (!rollbackFailureArchivesBefore.includes(name)) await fs.unlink(path.join(handoffDir, name)).catch(() => undefined);
+}
+if (!rollbackFailureIndexInjected
+    || !rollbackFailureRestoreInjected
+    || rollbackFailureIndexAfterRaw !== rollbackFailureIndexBeforeRaw
+    || generationId(rollbackFailureCurrentAfter) === generationId(rollbackFailureCurrentBefore)
+    || !rollbackFailureMarkerExists
+    || rollbackFailureArchivesAfter.length !== rollbackFailureArchivesBefore.length + 1
+    || rollbackFailureInjected) {
+  throw new Error(`failed current rollback was not durably fail-closed: ${JSON.stringify({
+    rollbackFailureIndexInjected,
+    rollbackFailureRestoreInjected,
+    rollbackFailureMarkerExists,
+    archiveDelta: rollbackFailureArchivesAfter.length - rollbackFailureArchivesBefore.length,
+    rollbackFailureInjected,
+  })}`);
+}
+
+// An unresolved marker is durable mismatch evidence. A later transaction must
+// not overwrite or clear it, even if that later write could otherwise succeed.
+const unresolvedPendingKey = 'agent:main:unresolved-pending-marker';
+const unresolvedPendingInitialFile = await writeTranscript(
+  'unresolved-pending-initial',
+  'establish initial pending-marker generation',
+);
+await handler(eventFor(unresolvedPendingKey, 'compact:before', unresolvedPendingInitialFile));
+const unresolvedPendingIndexBeforeRaw = await fs.readFile(indexPath, 'utf8');
+const unresolvedPendingIndexBefore = JSON.parse(unresolvedPendingIndexBeforeRaw);
+const unresolvedPendingCurrent = unresolvedPendingIndexBefore.sessions[unresolvedPendingKey].currentPath;
+const unresolvedPendingCurrentBefore = await fs.readFile(unresolvedPendingCurrent, 'utf8');
+const unresolvedPendingArchivesBefore = await archiveNames(unresolvedPendingKey, 'before');
+const unresolvedPendingMarker = `${unresolvedPendingCurrent}.pending`;
+const unresolvedPendingMarkerBytes = `${JSON.stringify({
+  schemaVersion: 1,
+  current: path.basename(unresolvedPendingCurrent),
+  createdAt: '2000-01-01T00:00:00',
+  unresolved: true,
+})}\n`;
+await fs.writeFile(unresolvedPendingMarker, unresolvedPendingMarkerBytes, { mode: 0o600 });
+const unresolvedPendingNextFile = await writeTranscript(
+  'unresolved-pending-next',
+  'must not overwrite unresolved pending marker',
+);
+await handler(eventFor(unresolvedPendingKey, 'compact:before', unresolvedPendingNextFile));
+const unresolvedPendingIndexAfterRaw = await fs.readFile(indexPath, 'utf8');
+const unresolvedPendingCurrentAfter = await fs.readFile(unresolvedPendingCurrent, 'utf8');
+const unresolvedPendingArchivesAfter = await archiveNames(unresolvedPendingKey, 'before');
+const unresolvedPendingMarkerAfter = await fs.readFile(unresolvedPendingMarker, 'utf8').catch(
+  (error) => (error?.code === 'ENOENT' ? undefined : Promise.reject(error)),
+);
+const unresolvedPendingBootstrap = {
+  type: 'agent',
+  action: 'bootstrap',
+  sessionKey: unresolvedPendingKey,
+  timestamp: new Date().toISOString(),
+  messages: [],
+  context: {
+    workspaceDir: root,
+    bootstrapFiles: [{
+      name: 'MEMORY.md',
+      path: unresolvedPendingCurrent,
+      content: 'PRELOADED_UNRESOLVED_PENDING_CURRENT',
+      missing: false,
+    }],
+  },
+};
+await handler(unresolvedPendingBootstrap);
+const unresolvedPendingInjected = unresolvedPendingBootstrap.context.bootstrapFiles.some(
+  (file) => file.path === unresolvedPendingCurrent,
+);
+await fs.writeFile(indexPath, unresolvedPendingIndexBeforeRaw, { mode: 0o600 });
+await fs.writeFile(unresolvedPendingCurrent, unresolvedPendingCurrentBefore, { mode: 0o600 });
+await fs.unlink(unresolvedPendingMarker).catch(() => undefined);
+for (const name of unresolvedPendingArchivesAfter) {
+  if (!unresolvedPendingArchivesBefore.includes(name)) {
+    await fs.unlink(path.join(handoffDir, name)).catch(() => undefined);
+  }
+}
+if (unresolvedPendingMarkerAfter !== unresolvedPendingMarkerBytes
+    || unresolvedPendingIndexAfterRaw !== unresolvedPendingIndexBeforeRaw
+    || unresolvedPendingCurrentAfter !== unresolvedPendingCurrentBefore
+    || unresolvedPendingArchivesAfter.length !== unresolvedPendingArchivesBefore.length
+    || unresolvedPendingInjected) {
+  throw new Error(`pre-existing pending marker was overwritten or cleared by a later transaction: ${JSON.stringify({
+    markerPreserved: unresolvedPendingMarkerAfter === unresolvedPendingMarkerBytes,
+    indexPreserved: unresolvedPendingIndexAfterRaw === unresolvedPendingIndexBeforeRaw,
+    currentPreserved: unresolvedPendingCurrentAfter === unresolvedPendingCurrentBefore,
+    archiveDelta: unresolvedPendingArchivesAfter.length - unresolvedPendingArchivesBefore.length,
+    bootstrapBlocked: !unresolvedPendingInjected,
+  })}`);
 }
 
 // Archive retention: only archives are pruned, with five per session/phase and a 30-day age cap.
@@ -556,6 +1316,7 @@ const result = {
   root,
   collisionArchives: collisionArchives.length,
   concurrentSessions: concurrentKeys.length,
+  crossProcessBootstrapInjections,
   corruptCopies: corruptCopies.length,
   retainedArchives: retainedArchives.length,
   evidenceSecrets: Object.keys(secretValues).length,
@@ -565,6 +1326,12 @@ const result = {
   reservedSeparatorInvariant: 'pass',
   orphanArchiveCleanup: 'pass',
   indexRenameRollback: 'pass',
+  currentWriteFailureRollback: 'pass',
+  preexistingPendingMarker: 'fail-closed-pass',
+  sharedFilesystemLocks: 'module-and-child-process-pass',
+  staleDeadOwnerLockRecovery: 'pass',
+  concurrentStaleRecoveryExclusion: 'pass',
+  interruptedRecoveryMarker: 'fail-closed-pass',
   indexedArchiveProtected: 'pass',
   postFloorTokenDelta: 'pass',
   highToSoftSuppression: 'pass',
