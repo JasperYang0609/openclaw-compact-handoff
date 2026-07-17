@@ -1,0 +1,39 @@
+# OpenClaw Compact Handoff v0.2.0
+
+Project: provider-independent OpenClaw hook pack for session continuity around context compaction.
+Repository: https://github.com/JasperYang0609/openclaw-compact-handoff
+Stable release: v0.2.0
+License: MIT
+
+Install (OpenClaw 2026.6.11 hook-only packs must be cloned before local-path installation):
+git clone --branch v0.2.0 --depth 1 https://github.com/JasperYang0609/openclaw-compact-handoff.git
+openclaw plugins install ./openclaw-compact-handoff
+openclaw hooks enable compact-handoff
+openclaw gateway restart
+
+Verify:
+openclaw hooks info compact-handoff
+openclaw hooks check
+openclaw gateway health
+
+Required hook result: compact-handoff ✓ Ready
+Required events: message:preprocessed, session:compact:before, session:compact:after, agent:bootstrap
+
+AI installer instructions: AGENTS.md
+Full installation, upgrade, rollback, and troubleshooting guide: INSTALL.md
+Human overview and limitations: README.md
+Release history: CHANGELOG.md
+
+Safety rules:
+- Do not change model/provider/channel/schedule/compaction settings during installation.
+- Do not edit OpenClaw global bundled dist files.
+- Do not publish or delete customer handoff files.
+- Verify real command output; copied files are not proof of installation.
+- On health regression, disable the hook and restart once.
+
+Scope:
+- supplements OpenClaw native compaction; does not replace the native summarizer;
+- does not choose the native compaction threshold;
+- performs no network request and no LLM call;
+- stores bounded, redacted, session-scoped handoffs locally;
+- reverify after every OpenClaw upgrade because internal hook APIs can change.
