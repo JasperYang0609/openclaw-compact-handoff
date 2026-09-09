@@ -146,9 +146,12 @@ When reviewing or packaging this repository:
 npm test
 npm run postrun:check
 npm pack --dry-run
+npm run test:ci:workflow-contract
 ```
 
 All commands must exit successfully. The test suite must leave no temporary-tree residue.
+
+Before pushing, accumulate a reviewable change and run `npm run check:push`. Non-main branches use the focused Ubuntu Branch Check; pull requests and `main` retain the full Ubuntu/macOS matrix. An open PR suppresses duplicate branch tests, superseded runs are cancelled, and genuine failure notifications remain enabled.
 
 ## Scope and limitations to explain to the operator
 
