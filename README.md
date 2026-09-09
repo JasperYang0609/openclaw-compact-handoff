@@ -59,6 +59,8 @@ Machine-oriented instructions are in:
 - [llms.txt](llms.txt) — compact project and command summary;
 - [INSTALL.md](INSTALL.md) — complete human-readable guide.
 
+Maintainers should accumulate a reviewable change and run `npm run check:push` before pushing. Non-main branches use the focused Ubuntu Branch Check; pull requests and `main` retain the full Ubuntu/macOS CI matrix. Open PRs suppress duplicate branch tests, superseded runs are cancelled, and genuine failure notifications remain enabled.
+
 ## Compatibility
 
 - **LLM/provider:** independent of provider and model; the hook does not call an LLM.

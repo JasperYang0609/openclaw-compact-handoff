@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -45,3 +47,6 @@ jobs:
 
       - name: Verify package contents
         run: npm pack --dry-run
+
+      - name: Verify CI workflow contract
+        run: npm run test:ci:workflow-contract

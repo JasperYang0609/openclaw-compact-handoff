@@ -43,7 +43,9 @@
     "test:resilience": "node scripts/test_compact_handoff_resilience.mjs",
     "test:p1c": "node scripts/test_compact_handoff_p1c.mjs",
     "test:authority": "node scripts/test_session_authority.mjs",
-    "postrun:check": "node scripts/post_run_check.mjs"
+    "postrun:check": "node scripts/post_run_check.mjs",
+    "test:ci:workflow-contract": "node scripts/test_ci_workflow_contract.mjs",
+    "check:push": "npm test && npm run postrun:check && npm pack --dry-run && npm run test:ci:workflow-contract"
   },
   "keywords": [
     "openclaw",
